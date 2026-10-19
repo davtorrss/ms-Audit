@@ -1,6 +1,8 @@
 package com.duoc.ms_vetcare_audit.messaging;
 
+import com.duoc.ms_vetcare_audit.service.AuditService;
 import com.rabbitmq.client.Channel;
+
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
@@ -13,6 +15,14 @@ public class AuditEventConsumer {
 
     private static final int MAX_RETRIES = 3;
     private static final long INITIAL_BACKOFF_MS = 1000;
+
+    private final AuditService auditService;
+
+    public AuditEventConsumer(
+            AuditService auditService
+    ) {
+        this.auditService = auditService;
+    }
 
     @RabbitListener(queues = RabbitNames.AUDIT_QUEUE)
     public void consume(
@@ -35,7 +45,7 @@ public class AuditEventConsumer {
                 );
 
                 System.out.println(
-                        "ACK enviado. Evento de Auditoría procesado correctamente."
+                        "ACK enviado. Evento de Auditoría guardado correctamente."
                 );
 
                 return;
@@ -108,6 +118,11 @@ public class AuditEventConsumer {
                 message
                         .getMessageProperties()
                         .getReceivedRoutingKey();
+
+        auditService.saveEvent(
+                receivedRoutingKey,
+                body
+        );
 
         System.out.println(
                 "Evento recibido en Auditoría:"
