@@ -51,7 +51,11 @@ import static org.junit.jupiter.api.Assertions.*;
 })
 class KafkaIntegrationTest {
 
-    private static final String BROKER = "localhost:9092";
+    private static final String BROKER =
+        System.getenv().getOrDefault(
+                "KAFKA_BOOTSTRAP_SERVERS",
+                "localhost:19092,localhost:19093,localhost:19094"
+        );
 
     private static final String SOURCE_TOPIC =
             "consultations.events";
