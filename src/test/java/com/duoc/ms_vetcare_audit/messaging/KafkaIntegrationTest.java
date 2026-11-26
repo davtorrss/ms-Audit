@@ -1,4 +1,3 @@
-
 package com.duoc.ms_vetcare_audit.messaging;
 
 import com.duoc.ms_vetcare_audit.config.KafkaErrorConfig;
@@ -17,6 +16,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
+
 import org.springframework.kafka.annotation.EnableKafka;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
@@ -24,7 +24,10 @@ import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
-import org.springframework.kafka.listener.CommonErrorHandler;
+import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.DefaultAfterRollbackProcessor;
+import org.springframework.kafka.transaction.KafkaTransactionManager;
+
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
 
@@ -62,6 +65,11 @@ class KafkaIntegrationTest {
     @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
 
+    /**
+     * PRUEBA 1:
+     * Un evento valido debe procesarse y publicarse
+     * en audit.timeline.
+     */
     @Test
     void eventoValidoLlegaAlTimeline() throws Exception {
 
@@ -84,12 +92,8 @@ class KafkaIntegrationTest {
 
             timelineConsumer.subscribe(List.of(TIMELINE_TOPIC));
 
-            // Enviar el evento al tópico de consultas.
-            kafkaTemplate.send(
-                    SOURCE_TOPIC,
-                    "999999",
-                    payload
-            ).get(15, TimeUnit.SECONDS);
+            // Publicar el mensaje de entrada en una transaccion.
+            sendSourceEvent(payload);
 
             long deadline = System.nanoTime()
                     + TimeUnit.SECONDS.toNanos(45);
@@ -103,40 +107,31 @@ class KafkaIntegrationTest {
 
                     if (payload.equals(record.value())) {
 
-                        assertEquals(
-                                eventId,
-                                record.key()
-                        );
+                        assertEquals(eventId, record.key());
 
                         System.out.println(
                                 "PRUEBA CORRECTA: evento recibido en audit.timeline"
                         );
 
-                        System.out.println(
-                                "EventId: " + eventId
-                        );
-
-                        System.out.println(
-                                "Topico: " + record.topic()
-                        );
-
-                        System.out.println(
-                                "Particion: " + record.partition()
-                        );
-
-                        System.out.println(
-                                "Offset: " + record.offset()
-                        );
+                        System.out.println("EventId: " + eventId);
+                        System.out.println("Topico: " + record.topic());
+                        System.out.println("Particion: " + record.partition());
+                        System.out.println("Offset: " + record.offset());
 
                         return;
                     }
                 }
             }
 
-            fail("El evento válido no llegó a audit.timeline");
+            fail("El evento valido no llego a audit.timeline");
         }
     }
 
+    /**
+     * PRUEBA 2:
+     * Un mensaje invalido debe provocar un rollback
+     * y finalmente publicarse en la DLT.
+     */
     @Test
     void mensajeIncorrectoTerminaEnDLT() throws Exception {
 
@@ -148,12 +143,8 @@ class KafkaIntegrationTest {
 
             dltConsumer.subscribe(List.of(DLT_TOPIC));
 
-            // Enviar un mensaje que no es JSON válido.
-            kafkaTemplate.send(
-                    SOURCE_TOPIC,
-                    "999999",
-                    payload
-            ).get(15, TimeUnit.SECONDS);
+            // Enviar un mensaje que no contiene JSON valido.
+            sendSourceEvent(payload);
 
             long deadline = System.nanoTime()
                     + TimeUnit.SECONDS.toNanos(45);
@@ -171,27 +162,46 @@ class KafkaIntegrationTest {
                                 "PRUEBA CORRECTA: mensaje recibido en DLT"
                         );
 
-                        System.out.println(
-                                "Topico: " + record.topic()
-                        );
-
-                        System.out.println(
-                                "Particion: " + record.partition()
-                        );
-
-                        System.out.println(
-                                "Offset: " + record.offset()
-                        );
+                        System.out.println("Topico: " + record.topic());
+                        System.out.println("Particion: " + record.partition());
+                        System.out.println("Offset: " + record.offset());
 
                         return;
                     }
                 }
             }
 
-            fail("El mensaje incorrecto no llegó a la DLT");
+            fail("El mensaje incorrecto no llego a la DLT");
         }
     }
 
+    /**
+     * Publica eventos de prueba mediante una transaccion.
+     *
+     * El KafkaTemplate utilizado por estas pruebas tiene
+     * un productor transaccional, por lo que el envio debe
+     * ejecutarse dentro de una transaccion Kafka.
+     */
+    private void sendSourceEvent(String payload) {
+
+        kafkaTemplate.executeInTransaction(operations -> {
+
+            operations.send(
+                    SOURCE_TOPIC,
+                    "999999",
+                    payload
+            );
+
+            return null;
+        });
+    }
+
+    /**
+     * Consumidor independiente para comprobar los resultados.
+     *
+     * read_committed impide que la prueba observe mensajes
+     * de transacciones abortadas.
+     */
     private KafkaConsumer<String, String> createVerificationConsumer(
             String purpose
     ) {
@@ -224,11 +234,21 @@ class KafkaIntegrationTest {
                 "earliest"
         );
 
+        properties.put(
+                ConsumerConfig.ISOLATION_LEVEL_CONFIG,
+                "read_committed"
+        );
+
         return new KafkaConsumer<>(properties);
     }
 
     /**
-     * Contexto independiente de PostgreSQL y RabbitMQ.
+     * Contexto de pruebas independiente de PostgreSQL
+     * y RabbitMQ.
+     *
+     * Se configura explicitamente el productor transaccional,
+     * el administrador de transacciones y el procesador
+     * de rollback.
      */
     @Configuration
     @EnableKafka
@@ -239,11 +259,18 @@ class KafkaIntegrationTest {
     })
     static class KafkaOnlyConfig {
 
+        private static final String TRANSACTION_PREFIX =
+                "vetcare-audit-integration-"
+                        + UUID.randomUUID() + "-";
+
         @Bean
         JsonMapper jsonMapper() {
             return JsonMapper.builder().build();
         }
 
+        /**
+         * Productor Kafka transaccional.
+         */
         @Bean
         ProducerFactory<String, String> producerFactory() {
 
@@ -269,16 +296,45 @@ class KafkaIntegrationTest {
                     "all"
             );
 
-            return new DefaultKafkaProducerFactory<>(properties);
+            properties.put(
+                    ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG,
+                    true
+            );
+
+            DefaultKafkaProducerFactory<String, String> factory =
+                    new DefaultKafkaProducerFactory<>(properties);
+
+            factory.setTransactionIdPrefix(
+                    TRANSACTION_PREFIX
+            );
+
+            return factory;
         }
 
         @Bean
         KafkaTemplate<String, String> kafkaTemplate(
                 ProducerFactory<String, String> producerFactory
         ) {
+
             return new KafkaTemplate<>(producerFactory);
         }
 
+        /**
+         * Administrador de transacciones Kafka.
+         *
+         * Utiliza el mismo ProducerFactory del KafkaTemplate.
+         */
+        @Bean
+        KafkaTransactionManager<String, String> kafkaTransactionManager(
+                ProducerFactory<String, String> producerFactory
+        ) {
+
+            return new KafkaTransactionManager<>(producerFactory);
+        }
+
+        /**
+         * Consumidor de Audit.
+         */
         @Bean
         ConsumerFactory<String, String> consumerFactory() {
 
@@ -314,21 +370,46 @@ class KafkaIntegrationTest {
                     false
             );
 
+            properties.put(
+                    ConsumerConfig.ISOLATION_LEVEL_CONFIG,
+                    "read_committed"
+            );
+
             return new DefaultKafkaConsumerFactory<>(properties);
         }
 
+        /**
+         * Contenedor Kafka configurado para transacciones.
+         */
         @Bean
         ConcurrentKafkaListenerContainerFactory<String, String>
         kafkaListenerContainerFactory(
                 ConsumerFactory<String, String> consumerFactory,
-                CommonErrorHandler kafkaErrorHandler
+                DefaultAfterRollbackProcessor<String, String>
+                        kafkaAfterRollbackProcessor,
+                KafkaTransactionManager<String, String>
+                        kafkaTransactionManager
         ) {
 
             ConcurrentKafkaListenerContainerFactory<String, String> factory =
                     new ConcurrentKafkaListenerContainerFactory<>();
 
             factory.setConsumerFactory(consumerFactory);
-            factory.setCommonErrorHandler(kafkaErrorHandler);
+
+            // Reemplaza el antiguo CommonErrorHandler.
+            factory.setAfterRollbackProcessor(
+                    kafkaAfterRollbackProcessor
+            );
+
+            // Coordina las transacciones del consumidor.
+            factory.getContainerProperties()
+                    .setKafkaAwareTransactionManager(
+                            kafkaTransactionManager
+                    );
+
+            factory.getContainerProperties().setAckMode(
+                    ContainerProperties.AckMode.RECORD
+            );
 
             return factory;
         }

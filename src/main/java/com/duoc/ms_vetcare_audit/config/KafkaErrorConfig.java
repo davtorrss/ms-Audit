@@ -1,4 +1,7 @@
+
 package com.duoc.ms_vetcare_audit.config;
+
+import java.time.Duration;
 
 import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
@@ -9,9 +12,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.listener.CommonErrorHandler;
-import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.listener.DefaultAfterRollbackProcessor;
 
 import org.springframework.util.backoff.FixedBackOff;
 
@@ -22,20 +24,22 @@ public class KafkaErrorConfig {
             LoggerFactory.getLogger(KafkaErrorConfig.class);
 
     /**
-     * Configura el manejo de errores del consumidor Kafka de Audit.
+     * Recuperacion transaccional del consumidor Kafka.
      *
-     * Si falla el procesamiento:
-     * 1. Se reintenta hasta dos veces.
-     * 2. Si continúa fallando, se publica en la DLT.
-     * 3. Si la recuperación se completa, el consumidor puede
-     *    continuar procesando otros registros.
+     * Si el procesamiento falla:
+     * 1. La transaccion actual se revierte.
+     * 2. El evento puede reprocesarse hasta dos veces.
+     * 3. Si sigue fallando, se envia a la DLT.
+     * 4. La publicacion en DLT y la confirmacion del
+     *    offset recuperado se coordinan en otra transaccion.
      */
     @Bean
-    public CommonErrorHandler kafkaErrorHandler(
-            KafkaTemplate<String, String> kafkaTemplate,
-            @Value("${vetcare.kafka.topics.audit-dlt}")
-            String dltTopic
-    ) {
+    public DefaultAfterRollbackProcessor<String, String>
+            kafkaAfterRollbackProcessor(
+                    KafkaTemplate<String, String> kafkaTemplate,
+                    @Value("${vetcare.kafka.topics.audit-dlt}")
+                    String dltTopic
+            ) {
 
         DeadLetterPublishingRecoverer recoverer =
                 new DeadLetterPublishingRecoverer(
@@ -47,17 +51,31 @@ public class KafkaErrorConfig {
                                 )
                 );
 
-        // Dos reintentos, con un segundo entre ellos.
+        // Si la DLT no confirma el envio, no dar
+        // la recuperacion por completada.
+        recoverer.setFailIfSendResultIsError(true);
+
+        recoverer.setWaitForSendResultTimeout(
+                Duration.ofSeconds(15)
+        );
+
+        // Dos reintentos, separados por un segundo.
         FixedBackOff backOff =
                 new FixedBackOff(1000L, 2L);
 
-        DefaultErrorHandler errorHandler =
-                new DefaultErrorHandler(recoverer, backOff);
+        DefaultAfterRollbackProcessor<String, String> processor =
+                new DefaultAfterRollbackProcessor<>(
+                        recoverer,
+                        backOff,
+                        kafkaTemplate,
+                        true
+                );
 
-        errorHandler.setRetryListeners(
+        processor.setRetryListeners(
                 (record, exception, deliveryAttempt) ->
                         log.warn(
-                                "Fallo procesando Kafka. topic={}, partition={}, offset={}, intento={}",
+                                "Reprocesamiento Kafka tras rollback. " +
+                                "topic={}, partition={}, offset={}, intento={}",
                                 record.topic(),
                                 record.partition(),
                                 record.offset(),
@@ -66,6 +84,6 @@ public class KafkaErrorConfig {
                         )
         );
 
-        return errorHandler;
+        return processor;
     }
 }
